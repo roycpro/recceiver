@@ -10,7 +10,7 @@ import java.net.UnknownHostException;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashSet;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -39,19 +39,23 @@ import java.util.logging.Logger;
  *   <li><strong>Connection Loss ({@link #connectionClosed(ConnectionClosedEvent)}):</strong>
  *       Immediately marks all IOC channels as inactive (or deletes them, depending on
  *       {@link #deleteOnClean}).</li>
- *   <li><strong>Shutdown ({@link #destroy()}):</strong> Iterates over all tracked IOCs and
- *       either deletes or marks inactive, per {@link #deleteOnShutdown} preference.</li>
+ *   <li><strong>Shutdown ({@link #destroy()}):</strong> If {@link #cleanOnShutdown} is true, either
+ *       deletes all of this recceiver's channels (if {@link #deleteOnClean} is true) or marks its
+ *       Active and Inactive channels Unknown. Otherwise leaves ChannelFinder untouched.</li>
  * </ol>
  * </p>
  *
  * <p><strong>Cleanup Preferences (Booleans):</strong>
  * <ul>
- *   <li>{@code recceiver.cf.delete-on-clean} (false by default): When an IOC's connection is lost,
- *       delete all its channels (true) or mark them inactive (false).</li>
- *   <li>{@code recceiver.cf.clean-on-startup} (false by default): On init, delete all existing
- *       active channels (true) or mark them inactive (false).</li>
- *   <li>{@code recceiver.cf.delete-on-shutdown} (true by default): On application shutdown, delete
- *       all tracked IOC channels (true) or mark them inactive (false).</li>
+ *   <li>{@code recceiver.cf.delete-on-clean} (false by default): How every cleanup is applied:
+ *       delete channels (true) or update their pvStatus (false). Applies when an IOC disconnects,
+ *       and to startup and shutdown cleanup.</li>
+ *   <li>{@code recceiver.cf.clean-on-startup} (false by default): On init, clean all of this
+ *       recceiver's channels: delete them (delete-on-clean=true) or mark them Inactive
+ *       (delete-on-clean=false). When false, startup does not touch existing channels.</li>
+ *   <li>{@code recceiver.cf.clean-on-shutdown} (true by default): On application shutdown, clean
+ *       all of this recceiver's channels: delete them (delete-on-clean=true) or mark them Unknown
+ *       (delete-on-clean=false). When false, shutdown does not touch ChannelFinder.</li>
  * </ul>
  * </p>
  *
@@ -85,7 +89,7 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
     private static final String PASSWORD_KEY = "recceiver.cf.password";
     private static final String DELETE_ON_CLEAN_KEY = "recceiver.cf.delete-on-clean";
     private static final String CLEAN_ON_STARTUP_KEY = "recceiver.cf.clean-on-startup";
-    private static final String DELETE_ON_SHUTDOWN_KEY = "recceiver.cf.delete-on-shutdown";
+    private static final String CLEAN_ON_SHUTDOWN_KEY = "recceiver.cf.clean-on-shutdown";
     private static final String ALIAS_ENABLED_KEY = "recceiver.cf.alias-enabled";
     private static final String INFOTAGS_KEY = "recceiver.cf.infotags";
     private static final String ENVIRONMENT_VARS_KEY = "recceiver.cf.environment-vars";
@@ -115,7 +119,7 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
     public static final String PVA_PORT_PROPERTY = "pvaPort";
     public static final String ACTIVE = "Active";
     public static final String INACTIVE = "Inactive";
-    public static final String UNDEFINED = "Undefined";
+    public static final String UNKNOWN = "Unknown";
     public static final String DEFAULT_OWNER = "cfstore";
 
     private static final String RECCEIVER_ID = resolveRecceiverId();
@@ -136,14 +140,13 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
     private ChannelFinderStore store;
     private boolean deleteOnClean;
     private boolean cleanOnStartup;
-    private boolean deleteOnShutdown;
+    private boolean cleanOnShutdown;
     private boolean aliasEnabled;
     private Set<String> infoTagWhitelist = Set.of();
     private Map<String, String> environmentVarMappings = Map.of();
 
     // IOC connection registry: tracks all IOCs that have connected to this processor.
     // Key = iocId (e.g., "host:port"), Value = IocInfo metadata
-    // Used during shutdown to clean up channels belonging to tracked IOCs.
     private final Map<String, IocInfo> iocRegistry = new ConcurrentHashMap<>();
     // Tracks recId -> channel names so delete messages (which only carry recId) can be resolved.
     private final Map<String, IocChannelState> iocChannelState = new ConcurrentHashMap<>();
@@ -172,7 +175,7 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
         this.store = createStore(serviceUrl, username, password);
         this.deleteOnClean = Boolean.parseBoolean(options.getOrDefault(DELETE_ON_CLEAN_KEY, "false"));
         this.cleanOnStartup = Boolean.parseBoolean(options.getOrDefault(CLEAN_ON_STARTUP_KEY, "false"));
-        this.deleteOnShutdown = Boolean.parseBoolean(options.getOrDefault(DELETE_ON_SHUTDOWN_KEY, "true"));
+        this.cleanOnShutdown = Boolean.parseBoolean(options.getOrDefault(CLEAN_ON_SHUTDOWN_KEY, "true"));
         this.aliasEnabled = Boolean.parseBoolean(options.getOrDefault(ALIAS_ENABLED_KEY, "false"));
         this.infoTagWhitelist = parseInfoTags(options.get(INFOTAGS_KEY));
         // Parse once at init so commit path only performs lookups.
@@ -186,49 +189,66 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
         requiredProperties.addAll(environmentVarMappings.values());
         this.store.ensureProperties(requiredProperties, propertyOwner);
 
-        cleanupExistingActiveChannelsForRecceiver();
+        if (cleanOnStartup) {
+            cleanupExistingActiveChannelsForRecceiver();
+        }
 
         return this;
     }
 
     /**
-     * On startup, cleans up any active channels previously published by this recceiver instance.
-     *
-     * <p>Finds all channels tagged with this recceiver's ID and filters for those with pvStatus=Active.
-     * If {@code cleanOnStartup} is true, deletes them. Otherwise, marks them as inactive with an
-     * updated timestamp. This prevents stale channels from lingering when the recceiver restarts.</p>
+     * On startup, cleans up any no inactive channels previously published by this recceiver instance.
      */
     private void cleanupExistingActiveChannelsForRecceiver() {
         Map<String, ChannelFinderChannel> existing = store.findByProperty(RECCEIVER_ID_PROPERTY, RECCEIVER_ID);
-        if (existing.isEmpty()) {
-            return;
-        }
+        cleanChannels(existing, INACTIVE);
+    }
 
-        Map<String, ChannelFinderChannel> activeChannels = new LinkedHashMap<>();
-        for (Map.Entry<String, ChannelFinderChannel> channelEntry : existing.entrySet()) {
-            if (ACTIVE.equals(channelEntry.getValue().property(PV_STATUS_PROPERTY))) {
-                activeChannels.put(channelEntry.getKey(), channelEntry.getValue());
+    /**
+     * Filter channels whose pvStatus is NOT IN {@code excludedStatuses}.
+     *
+     * @param excludedStatuses pvStatus values to skip; empty to return every channel.
+     */
+    private Map<String, ChannelFinderChannel> filterChannelsExcluding(Map<String, ChannelFinderChannel> channels,
+                                                                      Set<String> excludedStatuses) {
+        if (excludedStatuses.isEmpty()) {
+            return channels;
+        }
+        Map<String, ChannelFinderChannel> filtered = new LinkedHashMap<>();
+        for (Map.Entry<String, ChannelFinderChannel> channelEntry : channels.entrySet()) {
+            String status = channelEntry.getValue().property(PV_STATUS_PROPERTY);
+            if (status == null || !excludedStatuses.contains(status)) {
+                filtered.put(channelEntry.getKey(), channelEntry.getValue());
             }
         }
-        if (activeChannels.isEmpty()) {
+        return filtered;
+    }
+
+    /**
+     * Applies the configured cleanup to the given channels: deletes them if {@link #deleteOnClean}
+     * is true, otherwise sets their pvStatus to {@code statusIfKept} and refreshes their timestamp.
+     *
+     * @param channels channels to clean, keyed by name.
+     * @param statusIfKept pvStatus to write when channels are kept rather than deleted.
+     */
+    private void cleanChannels(Map<String, ChannelFinderChannel> channels, String statusIfKept) {
+        if (channels.isEmpty()) {
             return;
         }
-
-        // Startup cleanup mode: cleanOnStartup=true => delete, false => mark inactive.
-        if (cleanOnStartup) {
-            store.deleteChannels(activeChannels.keySet());
+        if (deleteOnClean) {
+            store.deleteChannels(channels.keySet());
             return;
         }
-
+        Map<String, ChannelFinderChannel> filteredChannels = filterChannelsExcluding(channels, Collections.singleton(statusIfKept));
         String now = OffsetDateTime.now().toString();
-        Collection<ChannelFinderChannel> inactiveChannels = new ArrayList<>();
-        for (ChannelFinderChannel channel : activeChannels.values()) {
+        Collection<ChannelFinderChannel> updated = new ArrayList<>();
+        for (ChannelFinderChannel channel : filteredChannels.values()) {
             Map<String, String> properties = new LinkedHashMap<>(channel.properties());
-            properties.put(PV_STATUS_PROPERTY, INACTIVE);
+            properties.put(PV_STATUS_PROPERTY, statusIfKept);
             properties.put(TIME_PROPERTY, now);
-            inactiveChannels.add(new ChannelFinderChannel(channel.name(), channel.owner(), properties));
+            updated.add(new ChannelFinderChannel(channel.name(), channel.owner(), properties));
         }
-        store.updateChannels(inactiveChannels);
+        store.updateChannels(updated);
     }
 
     protected ChannelFinderStore createStore(String serviceUrl, String username, String password) {
@@ -240,8 +260,7 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
     /**
      * Processes a transaction from an IOC, updating channel records in ChannelFinder.
      *
-     * <p><strong>On initial=true (first commit):</strong> Registers the IOC in the shutdown
-     * registry so it can be cleaned up during shutdown.</p>
+     * <p><strong>On initial=true (first commit):</strong> Registers the IOC in the IOC registry.</p>
      *
      * <p><strong>On connected=false:</strong> Immediately triggers cleanup for this IOC's channels
      * by calling {@link #connectionClosed(ConnectionClosedEvent)}. This allows graceful disconnect
@@ -271,7 +290,7 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
 
         String iocId = resolveIocId(transaction);
 
-        // Register this IOC in the registry for shutdown cleanup tracking.
+        // Register this IOC in the in-memory IOC registry.
         if (transaction.initial()) {
             if (iocId != null && !iocId.isBlank()) {
                 Map<String, String> clientInfos = transaction.clientInfos();
@@ -286,7 +305,7 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
                         OffsetDateTime.now().toString()
                 );
                 iocRegistry.put(iocId, iocInfo);
-                log.info(() -> "[CFRecSyncProcessor] registered IOC in shutdown registry: " + iocId);
+                log.info(() -> "[CFRecSyncProcessor] registered IOC: " + iocId);
             }
         }
 
@@ -379,25 +398,7 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
             return;
         }
 
-        Map<String, ChannelFinderChannel> existing = store.findByNames(channelNamesToCleanup);
-        if (existing.isEmpty()) {
-            return;
-        }
-
-        if (deleteOnClean) {
-            store.deleteChannels(existing.keySet());
-            return;
-        }
-
-        String now = OffsetDateTime.now().toString();
-        Collection<ChannelFinderChannel> inactiveChannels = new ArrayList<>();
-        for (ChannelFinderChannel channel : existing.values()) {
-            Map<String, String> properties = new LinkedHashMap<>(channel.properties());
-            properties.put(PV_STATUS_PROPERTY, INACTIVE);
-            properties.put(TIME_PROPERTY, now);
-            inactiveChannels.add(new ChannelFinderChannel(channel.name(), channel.owner(), properties));
-        }
-        store.updateChannels(inactiveChannels);
+        cleanChannels(store.findByNames(channelNamesToCleanup), INACTIVE);
     }
 
     private Collection<ChannelFinderChannel> buildChannels(RecSyncTransaction transaction) {
@@ -603,115 +604,36 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
             return;
         }
 
-        if (deleteOnClean) {
-            store.deleteChannels(existing.keySet());
-            iocRegistry.remove(iocId);
-            iocChannelState.remove(iocId);
-            return;
-        }
-
-        String now = OffsetDateTime.now().toString();
-        Collection<ChannelFinderChannel> inactiveChannels = new ArrayList<>();
-        for (ChannelFinderChannel channel : existing.values()) {
-            Map<String, String> properties = new LinkedHashMap<>(channel.properties());
-            properties.put(PV_STATUS_PROPERTY, INACTIVE);
-            properties.put(TIME_PROPERTY, now);
-            inactiveChannels.add(new ChannelFinderChannel(channel.name(), channel.owner(), properties));
-        }
-        store.updateChannels(inactiveChannels);
+        cleanChannels(existing, INACTIVE);
         iocRegistry.remove(iocId);
         iocChannelState.remove(iocId);
     }
 
     @Override
     public void destroy() {
-        System.err.println("[CFRecSyncProcessor] destroy: cleaning up tracked IOCs on shutdown");
-        log.info("[CFRecSyncProcessor] destroy: cleaning up tracked IOCs on shutdown");
-        try {
-            cleanupTrackedIocs();
-        } catch (Exception e) {
-            System.err.println("[CFRecSyncProcessor] error during shutdown cleanup: " + e.getMessage());
-            log.severe("[CFRecSyncProcessor] error during shutdown cleanup: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Performs cleanup of all IOCs tracked in the iocRegistry.
-     * Called during application shutdown via Spring @PreDestroy lifecycle.
-     * If deleteOnShutdown is true, deletes all channels belonging to tracked IOCs.
-     * Otherwise, marks them as inactive.
-     */
-    private void cleanupTrackedIocs() {
-        if (iocRegistry.isEmpty()) {
-            System.err.println("[CFRecSyncProcessor] no IOCs to clean up on shutdown");
-            log.info("[CFRecSyncProcessor] no IOCs to clean up on shutdown");
+        if (!cleanOnShutdown) {
+            log.info("[CFRecSyncProcessor] destroy: clean-on-shutdown disabled, leaving ChannelFinder untouched");
             return;
         }
-
-        String msg = "[CFRecSyncProcessor] cleaning up " + iocRegistry.size() + " tracked IOCs";
-        System.err.println(msg);
-        log.info(msg);
-
-        // Iterate over a copy of the registry keys to avoid ConcurrentModificationException
-        Set<String> iocIds = new HashSet<>(iocRegistry.keySet());
-        for (String iocId : iocIds) {
-            try {
-                cleanupIoc(iocId);
-            } catch (Exception e) {
-                String errMsg = "[CFRecSyncProcessor] error cleaning up IOC " + iocId + ": " + e.getMessage();
-                System.err.println(errMsg);
-                log.warning(() -> errMsg);
-            }
+        try {
+            Map<String, ChannelFinderChannel> channels = store.findByProperty(RECCEIVER_ID_PROPERTY, RECCEIVER_ID);
+            log.info(() -> "[CFRecSyncProcessor] destroy: "
+                    + (deleteOnClean ? "deleting " : "marking " + UNKNOWN + " ")
+                    + channels.size() + " channels for recceiver " + RECCEIVER_ID);
+            cleanChannels(channels, UNKNOWN);
+        } catch (Exception e) {
+            String errMsg = "[CFRecSyncProcessor] error during shutdown cleanup: " + e.getMessage();
+            System.err.println(errMsg);
+            log.severe(() -> errMsg);
+        } finally {
+            iocRegistry.clear();
+            iocChannelState.clear();
         }
     }
 
     protected int iocRegistrySize() {
         return iocRegistry.size();
     }
-
-    /**
-     * Cleans up channels for a specific IOC.
-     * @param iocId the IOC ID to clean up (e.g., "host:port")
-     */
-    private void cleanupIoc(String iocId) {
-        Map<String, ChannelFinderChannel> existing = store.findByProperty(IOC_ID_PROPERTY, iocId);
-        if (existing.isEmpty()) {
-            String msg = "[CFRecSyncProcessor] no channels found for IOC " + iocId;
-            System.err.println(msg);
-            log.info(msg);
-            iocRegistry.remove(iocId);
-            iocChannelState.remove(iocId);
-            return;
-        }
-
-        String foundMsg = "[CFRecSyncProcessor] found " + existing.size() + " channels for IOC " + iocId;
-        System.err.println(foundMsg);
-        log.info(foundMsg);
-
-        if (deleteOnShutdown) {
-            String deleteMsg = "[CFRecSyncProcessor] deleting " + existing.size() + " channels for IOC " + iocId;
-            System.err.println(deleteMsg);
-            log.info(deleteMsg);
-            store.deleteChannels(existing.keySet());
-        } else {
-            String inactiveMsg = "[CFRecSyncProcessor] marking " + existing.size() + " channels as undefined for IOC " + iocId;
-            System.err.println(inactiveMsg);
-            log.info(inactiveMsg);
-            String now = OffsetDateTime.now().toString();
-            Collection<ChannelFinderChannel> inactiveChannels = new ArrayList<>();
-            for (ChannelFinderChannel channel : existing.values()) {
-                Map<String, String> properties = new LinkedHashMap<>(channel.properties());
-                properties.put(PV_STATUS_PROPERTY, UNDEFINED);
-                properties.put(TIME_PROPERTY, now);
-                inactiveChannels.add(new ChannelFinderChannel(channel.name(), channel.owner(), properties));
-            }
-            store.updateChannels(inactiveChannels);
-        }
-
-        iocRegistry.remove(iocId);
-        iocChannelState.remove(iocId);
-    }
-
 
     private static String resolveIocId(String sourceAddress) {
         if (sourceAddress == null || sourceAddress.isBlank()) {
@@ -861,10 +783,8 @@ public class CFRecSyncProcessor implements RecSyncProcessor {
     }
 
     /**
-     * Metadata about a connected IOC, tracked for shutdown cleanup.
+     * Metadata about a connected IOC, kept in the in-memory IOC registry.
      *
-     * <p>Allows the processor to know which IOCs to clean up when the application shuts down,
-     * even if some IOCs are not currently connected.</p>
      *
      * <p>Fields include source address, host, port, IOC name, host name, owner, and connection timestamp.</p>
      */

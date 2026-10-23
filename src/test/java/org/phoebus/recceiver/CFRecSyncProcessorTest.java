@@ -20,6 +20,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -134,10 +135,8 @@ class CFRecSyncProcessorTest {
         assertEquals(13, store.ensuredProperties.size());
     }
 
-    @Test
-    void initCleanOnStartupFalseMarksActiveChannelsInactive() {
-        TestStore store = new TestStore();
-        store.findByPropertyResult = Map.of(
+    private static Map<String, ChannelFinderChannel> activeAndInactiveChannels() {
+        return Map.of(
                 "pv:active", new ChannelFinderChannel("pv:active", "owner1", Map.of(
                         CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.ACTIVE,
                         CFRecSyncProcessor.TIME_PROPERTY, "old-time"
@@ -147,12 +146,53 @@ class CFRecSyncProcessorTest {
                         CFRecSyncProcessor.TIME_PROPERTY, "old-time"
                 ))
         );
+    }
+
+    @Test
+    void initDoesNothingWhenCleanOnStartupFalse() {
+        TestStore store = new TestStore();
+        store.findByPropertyResult = activeAndInactiveChannels();
         TestProcessor processor = new TestProcessor(store);
 
         RecSyncProcessor initialized = processor.init("cf", Map.of(
                 "recceiver.cf.enabled", "true",
                 "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
-                "recceiver.cf.clean-on-startup", "false"
+                "recceiver.cf.clean-on-startup", "false",
+                "recceiver.cf.delete-on-clean", "true"
+        ));
+
+        assertNotNull(initialized);
+        assertEquals(0, store.updatedChannels.size());
+        assertEquals(0, store.deletedChannelNames.size());
+    }
+
+    @Test
+    void initDoesNothingByDefault() {
+        TestStore store = new TestStore();
+        store.findByPropertyResult = activeAndInactiveChannels();
+        TestProcessor processor = new TestProcessor(store);
+
+        RecSyncProcessor initialized = processor.init("cf", Map.of(
+            "recceiver.cf.enabled", "true",
+            "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder"
+        ));
+
+        assertNotNull(initialized);
+        assertEquals(0, store.updatedChannels.size());
+        assertEquals(0, store.deletedChannelNames.size());
+    }
+
+    @Test
+    void initCleanOnStartupMarksActiveChannelsInactiveWhenDeleteOnCleanFalse() {
+        TestStore store = new TestStore();
+        store.findByPropertyResult = activeAndInactiveChannels();
+        TestProcessor processor = new TestProcessor(store);
+
+        RecSyncProcessor initialized = processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.clean-on-startup", "true",
+                "recceiver.cf.delete-on-clean", "false"
         ));
 
         assertNotNull(initialized);
@@ -164,28 +204,21 @@ class CFRecSyncProcessorTest {
     }
 
     @Test
-    void initCleanOnStartupTrueDeletesActiveChannels() {
+    void initCleanOnStartupDeletesAllRecceiverChannelsWhenDeleteOnCleanTrue() {
         TestStore store = new TestStore();
-        store.findByPropertyResult = Map.of(
-                "pv:active", new ChannelFinderChannel("pv:active", "owner1", Map.of(
-                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.ACTIVE
-                )),
-                "pv:inactive", new ChannelFinderChannel("pv:inactive", "owner1", Map.of(
-                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.INACTIVE
-                ))
-        );
+        store.findByPropertyResult = activeAndInactiveChannels();
         TestProcessor processor = new TestProcessor(store);
 
         RecSyncProcessor initialized = processor.init("cf", Map.of(
                 "recceiver.cf.enabled", "true",
                 "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
-                "recceiver.cf.clean-on-startup", "true"
+                "recceiver.cf.clean-on-startup", "true",
+                "recceiver.cf.delete-on-clean", "true"
         ));
 
         assertNotNull(initialized);
         assertEquals(0, store.updatedChannels.size());
-        assertEquals(1, store.deletedChannelNames.size());
-        assertTrue(store.deletedChannelNames.contains("pv:active"));
+        assertEquals(Set.of("pv:active", "pv:inactive"), Set.copyOf(store.deletedChannelNames));
     }
 
     @Test
@@ -413,25 +446,31 @@ class CFRecSyncProcessorTest {
     }
 
     @Test
-    void initParsesDeleteOnShutdownConfiguration() {
+    void initIgnoresRemovedDeleteOnShutdownOption() {
         TestStore store = new TestStore();
+        store.findByPropertyResult = Map.of(
+                "pv:one", new ChannelFinderChannel("pv:one", "owner1", Map.of(
+                        CFRecSyncProcessor.IOC_ID_PROPERTY, "127.0.0.1:5070",
+                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.ACTIVE
+                ))
+        );
         TestProcessor processor = new TestProcessor(store);
 
-        // Test default value (true)
         RecSyncProcessor initialized = processor.init("cf", Map.of(
                 "recceiver.cf.enabled", "true",
-                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder"
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.delete-on-shutdown", "true"
         ));
         assertNotNull(initialized);
 
-        // Test explicit false value
-        TestProcessor processorFalse = new TestProcessor(store);
-        initialized = processorFalse.init("cf", Map.of(
-                "recceiver.cf.enabled", "true",
-                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
-                "recceiver.cf.delete-on-shutdown", "false"
-        ));
-        assertNotNull(initialized);
+        processor.commit(initialTransactionFor("pv:one"));
+        store.updatedChannels.clear();
+        processor.destroy();
+
+        assertEquals(0, store.deletedChannelNames.size());
+        assertEquals(1, store.updatedChannels.size());
+        assertEquals(CFRecSyncProcessor.UNKNOWN,
+            store.updatedChannels.getFirst().property(CFRecSyncProcessor.PV_STATUS_PROPERTY));
     }
 
     @Test
@@ -462,27 +501,10 @@ class CFRecSyncProcessorTest {
         assertEquals(1, processor.getIocRegistrySize());
     }
 
-    @Test
-    void destroyMarksChannelsUndefinedWhenDeleteOnShutdownFalse() {
-        TestStore store = new TestStore();
-        store.findByPropertyResult = Map.of(
-                "pv:one", new ChannelFinderChannel("pv:one", "owner1", Map.of(
-                        CFRecSyncProcessor.IOC_ID_PROPERTY, "127.0.0.1:5070",
-                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.ACTIVE
-                ))
-        );
-
-        TestProcessor processor = new TestProcessor(store);
-        processor.init("cf", Map.of(
-                "recceiver.cf.enabled", "true",
-                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
-                "recceiver.cf.delete-on-shutdown", "false"
-        ));
-
-        // Register an IOC
-        RecSyncTransaction transaction = new RecSyncTransaction(
+    private static RecSyncTransaction initialTransactionFor(String recordName) {
+        return new RecSyncTransaction(
                 "/127.0.0.1:5070",
-                List.of(new AddRecordMessage(10, 0, 3, 6, "ai", "pv:one")),
+                List.of(new AddRecordMessage(10, 0, 3, 6, "ai", recordName)),
                 List.of(),
                 List.of(),
                 Map.of(
@@ -492,61 +514,230 @@ class CFRecSyncProcessorTest {
                 true,
                 true
         );
-        processor.commit(transaction);
+    }
 
+    private static TestStore storeWithOneActiveIocChannel() {
+        TestStore store = new TestStore();
+        store.findByPropertyResult = Map.of(
+                "pv:one", new ChannelFinderChannel("pv:one", "owner1", Map.of(
+                        CFRecSyncProcessor.IOC_ID_PROPERTY, "127.0.0.1:5070",
+                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.ACTIVE
+                ))
+        );
+        return store;
+    }
+
+    @Test
+    void destroyDoesNothingWhenCleanOnShutdownFalse() {
+        TestStore store = storeWithOneActiveIocChannel();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.clean-on-shutdown", "false",
+                "recceiver.cf.delete-on-clean", "true"
+        ));
+        processor.commit(initialTransactionFor("pv:one"));
         store.updatedChannels.clear();
 
-        // Destroy should mark channels as undefined, not delete them
         processor.destroy();
 
-        // Verify channels were updated (not deleted)
-        assertEquals(1, store.updatedChannels.size());
-        ChannelFinderChannel updated = store.updatedChannels.get(0);
-        assertEquals(CFRecSyncProcessor.UNDEFINED, updated.property(CFRecSyncProcessor.PV_STATUS_PROPERTY));
+        assertEquals(0, store.updatedChannels.size());
         assertEquals(0, store.deletedChannelNames.size());
     }
 
     @Test
-    void destroyDeletesChannelsWhenDeleteOnShutdownTrue() {
-        TestStore store = new TestStore();
-        store.findByPropertyResult = Map.of(
-                "pv:one", new ChannelFinderChannel("pv:one", "owner1", Map.of(
-                        CFRecSyncProcessor.IOC_ID_PROPERTY, "127.0.0.1:5070",
-                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.ACTIVE
-                ))
-        );
+    void destroyMarksChannelsUnknownByDefault() {
+        TestStore store = storeWithOneActiveIocChannel();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder"
+        ));
+        processor.commit(initialTransactionFor("pv:one"));
+        store.updatedChannels.clear();
 
+        processor.destroy();
+
+        assertEquals(1, store.updatedChannels.size());
+        assertEquals(CFRecSyncProcessor.UNKNOWN,
+            store.updatedChannels.getFirst().property(CFRecSyncProcessor.PV_STATUS_PROPERTY));
+        assertEquals(0, store.deletedChannelNames.size());
+    }
+
+    @Test
+    void destroyMarksChannelsUnknownWhenCleanOnShutdownAndDeleteOnCleanFalse() {
+        TestStore store = storeWithOneActiveIocChannel();
         TestProcessor processor = new TestProcessor(store);
         processor.init("cf", Map.of(
                 "recceiver.cf.enabled", "true",
                 "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
-                "recceiver.cf.delete-on-shutdown", "true"
+                "recceiver.cf.clean-on-shutdown", "true",
+                "recceiver.cf.delete-on-clean", "false"
         ));
-
-        // Register an IOC
-        RecSyncTransaction transaction = new RecSyncTransaction(
-                "/127.0.0.1:5070",
-                List.of(new AddRecordMessage(10, 0, 3, 6, "ai", "pv:one")),
-                List.of(),
-                List.of(),
-                Map.of(
-                        CFRecSyncProcessor.IOCNAME_KEY, "ioc-a",
-                        CFRecSyncProcessor.HOSTNAME_KEY, "host-a"
-                ),
-                true,
-                true
-        );
-        processor.commit(transaction);
-
+        processor.commit(initialTransactionFor("pv:one"));
         store.updatedChannels.clear();
 
-        // Destroy should delete channels
         processor.destroy();
 
-        // Verify channels were deleted, not updated
+        assertEquals(1, store.updatedChannels.size());
+        ChannelFinderChannel updated = store.updatedChannels.get(0);
+        assertEquals(CFRecSyncProcessor.UNKNOWN, updated.property(CFRecSyncProcessor.PV_STATUS_PROPERTY));
+        assertEquals(0, store.deletedChannelNames.size());
+        assertEquals(0, processor.getIocRegistrySize());
+    }
+
+    @Test
+    void destroyDeletesChannelsWhenCleanOnShutdownAndDeleteOnCleanTrue() {
+        TestStore store = storeWithOneActiveIocChannel();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.clean-on-shutdown", "true",
+                "recceiver.cf.delete-on-clean", "true"
+        ));
+        processor.commit(initialTransactionFor("pv:one"));
+        store.updatedChannels.clear();
+
+        processor.destroy();
+
         assertEquals(0, store.updatedChannels.size());
         assertEquals(1, store.deletedChannelNames.size());
         assertTrue(store.deletedChannelNames.contains("pv:one"));
+        assertEquals(0, processor.getIocRegistrySize());
+    }
+
+    private static Map<String, ChannelFinderChannel> channelsInEveryStatus() {
+        return Map.of(
+                "pv:active", new ChannelFinderChannel("pv:active", "owner1", Map.of(
+                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.ACTIVE,
+                        CFRecSyncProcessor.TIME_PROPERTY, "old-time"
+                )),
+                "pv:inactive", new ChannelFinderChannel("pv:inactive", "owner1", Map.of(
+                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.INACTIVE,
+                        CFRecSyncProcessor.TIME_PROPERTY, "old-time"
+                )),
+                "pv:unknown", new ChannelFinderChannel("pv:unknown", "owner1", Map.of(
+                        CFRecSyncProcessor.PV_STATUS_PROPERTY, CFRecSyncProcessor.UNKNOWN,
+                        CFRecSyncProcessor.TIME_PROPERTY, "old-time"
+                )),
+                "pv:custom", new ChannelFinderChannel("pv:custom", "owner1", Map.of(
+                    CFRecSyncProcessor.PV_STATUS_PROPERTY, "Custom",
+                    CFRecSyncProcessor.TIME_PROPERTY, "old-time"
+                ))
+        );
+    }
+
+    private static Map<String, ChannelFinderChannel> byName(List<ChannelFinderChannel> channels) {
+        Map<String, ChannelFinderChannel> result = new LinkedHashMap<>();
+        for (ChannelFinderChannel channel : channels) {
+            result.put(channel.name(), channel);
+        }
+        return result;
+    }
+
+    @Test
+    void initCleanOnStartupMarksEveryChannelNotAlreadyInactiveAsInactive() {
+        TestStore store = new TestStore();
+        store.findByPropertyResult = channelsInEveryStatus();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+            "recceiver.cf.enabled", "true",
+            "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+            "recceiver.cf.clean-on-startup", "true",
+            "recceiver.cf.delete-on-clean", "false"
+        ));
+
+        Map<String, ChannelFinderChannel> updated = byName(store.updatedChannels);
+        // Every status (including Unknown, unexpected or missing) becomes Inactive;
+        // channels already Inactive are not rewritten.
+        assertEquals(Set.of("pv:active", "pv:unknown", "pv:custom"), updated.keySet());
+        for (ChannelFinderChannel channel : updated.values()) {
+            assertEquals(CFRecSyncProcessor.INACTIVE, channel.property(CFRecSyncProcessor.PV_STATUS_PROPERTY));
+        }
+        assertEquals(0, store.deletedChannelNames.size());
+    }
+
+    @Test
+    void destroyCleansRecceiverChannelsEvenWhenNoIocTrackedInMemory() {
+        // e.g. channels left behind by a previous run that crashed
+        TestStore store = new TestStore();
+        store.findByPropertyResult = activeAndInactiveChannels();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.clean-on-shutdown", "true"
+        ));
+        assertEquals(0, processor.getIocRegistrySize());
+
+        processor.destroy();
+
+        assertEquals(2, store.updatedChannels.size());
+    }
+
+    @Test
+    void destroyMarksEveryChannelNotAlreadyUnknownAsUnknownWhenDeleteOnCleanFalse() {
+        TestStore store = new TestStore();
+        store.findByPropertyResult = channelsInEveryStatus();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.clean-on-shutdown", "true",
+                "recceiver.cf.delete-on-clean", "false"
+        ));
+
+        processor.destroy();
+
+        Map<String, ChannelFinderChannel> updatedByName = byName(store.updatedChannels);
+        // Every status (including unexpected or missing ones) becomes Unknown;
+
+
+        // channels already Unknown are not rewritten.
+        assertEquals(Set.of("pv:active", "pv:inactive", "pv:custom"), updatedByName.keySet());
+        for (ChannelFinderChannel channel : updatedByName.values()) {
+            assertEquals(CFRecSyncProcessor.UNKNOWN, channel.property(CFRecSyncProcessor.PV_STATUS_PROPERTY));
+            assertNotEquals("old-time", channel.property(CFRecSyncProcessor.TIME_PROPERTY));
+        }
+        assertEquals(0, store.deletedChannelNames.size());
+    }
+
+    @Test
+    void destroyDeletesAllRecceiverChannelsWhenDeleteOnCleanTrue() {
+        TestStore store = new TestStore();
+        store.findByPropertyResult = channelsInEveryStatus();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.clean-on-shutdown", "true",
+                "recceiver.cf.delete-on-clean", "true"
+        ));
+
+        processor.destroy();
+
+        assertEquals(Set.of("pv:active", "pv:inactive", "pv:unknown", "pv:custom"),
+            Set.copyOf(store.deletedChannelNames));
+        assertEquals(0, store.updatedChannels.size());
+    }
+
+    @Test
+    void destroyQueriesByRecceiverId() {
+        TestStore store = storeWithOneActiveIocChannel();
+        TestProcessor processor = new TestProcessor(store);
+        processor.init("cf", Map.of(
+                "recceiver.cf.enabled", "true",
+                "recceiver.cf.service-url", "http://localhost:9090/ChannelFinder",
+                "recceiver.cf.clean-on-shutdown", "true"
+        ));
+        processor.commit(initialTransactionFor("pv:one"));
+        store.findByPropertyNames.clear();
+
+        processor.destroy();
+
+        assertEquals(List.of(CFRecSyncProcessor.RECCEIVER_ID_PROPERTY), store.findByPropertyNames);
     }
 
     @Test
@@ -751,6 +942,7 @@ class CFRecSyncProcessorTest {
         private final List<String> deletedChannelNames = new ArrayList<>();
         private Map<String, ChannelFinderChannel> findByNamesResult = Map.of();
         private Map<String, ChannelFinderChannel> findByPropertyResult = Map.of();
+        private final List<String> findByPropertyNames = new ArrayList<>();
 
         @Override
         public Map<String, ChannelFinderChannel> findByNames(Set<String> channelNames) {
@@ -766,6 +958,7 @@ class CFRecSyncProcessorTest {
 
         @Override
         public Map<String, ChannelFinderChannel> findByProperty(String propertyName, String propertyValue) {
+            findByPropertyNames.add(propertyName);
             return findByPropertyResult;
         }
 
